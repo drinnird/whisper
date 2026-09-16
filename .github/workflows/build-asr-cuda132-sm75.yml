@@ -176,6 +176,13 @@ jobs:
             return $null
           }
 
+          function Test-WindowsApiSetName {
+            param([Parameter(Mandatory=$true)][string]$DllName)
+            # API-set contract DLL names are resolved by the Windows loader and are not
+            # app-local files. They may not exist as literal files in System32.
+            return ($DllName -match '^(api|ext)-ms-win-.*\.dll$')
+          }
+
           function Add-RuntimeDependencyClosure {
             param(
               [Parameter(Mandatory=$true)][string]$Destination,
@@ -209,6 +216,11 @@ jobs:
                   $queue.Enqueue($local)
                   continue
                 }
+
+                # Windows API-set contracts are loader-provided virtual/system contracts.
+                # They often do not exist as literal files in System32, so classify them
+                # before the physical System32 file check.
+                if (Test-WindowsApiSetName -DllName $dep) { continue }
 
                 # Windows system DLLs are intentionally not copied app-local.
                 $systemDll = Join-Path $env:SystemRoot "System32\$dep"
