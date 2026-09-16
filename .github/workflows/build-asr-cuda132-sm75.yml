@@ -104,6 +104,7 @@ jobs:
 
           $wbin = Join-Path $env:GITHUB_WORKSPACE 'build-whisper\bin\Release'
           $lbin = Join-Path $env:GITHUB_WORKSPACE 'build-llama\bin\Release'
+          $pbin = Join-Path $env:GITHUB_WORKSPACE 'build-parakeet\bin\Release'
           if (-not (Test-Path "$wbin\whisper-cli.exe")) { throw 'whisper-cli.exe missing' }
           if (-not (Test-Path "$wbin\parakeet-cli.exe")) { throw 'whisper.cpp parakeet-cli.exe missing' }
           if (-not (Test-Path "$lbin\llama-mtmd-cli.exe")) { throw 'llama-mtmd-cli.exe missing' }
@@ -124,6 +125,121 @@ jobs:
             Where-Object { $_.FullName -match '\\Release\\|bin' } |
             ForEach-Object { Copy-Item $_.FullName -Destination 'dist\parakeetcpp' -Force }
 
+          # Build an app-local dependency closure for each runtime. This catches DLLs that
+          # CMake emits outside the immediate executable directory and CUDA/MSVC runtime
+          # dependencies that otherwise cause STATUS_DLL_NOT_FOUND (0xC0000135) at startup.
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) { throw "vswhere.exe not found: $vswhere" }
+          $vsInstall = (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1)
+          if (-not $vsInstall) { throw 'Visual Studio C++ installation path could not be resolved' }
+          $dumpbin = Get-ChildItem (Join-Path $vsInstall 'VC\Tools\MSVC') -Filter dumpbin.exe -File -Recurse |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $dumpbin) { throw 'dumpbin.exe could not be resolved from Visual Studio' }
+
+          $vcRedistRoot = Join-Path $vsInstall 'VC\Redist\MSVC'
+          $vcRuntimeDirs = @()
+          if (Test-Path -LiteralPath $vcRedistRoot -PathType Container) {
+            $latestRedist = Get-ChildItem $vcRedistRoot -Directory | Sort-Object Name -Descending | Select-Object -First 1
+            if ($latestRedist) {
+              $vcRuntimeDirs = @(Get-ChildItem $latestRedist.FullName -Directory -Recurse |
+                Where-Object { $_.FullName -match '\\x64\\' } |
+                Select-Object -ExpandProperty FullName)
+            }
+          }
+
+          $cudaRuntimeDirs = @(
+            (Join-Path $env:CUDA_PATH 'bin'),
+            (Join-Path $env:CUDA_PATH 'bin\x64')
+          ) | Where-Object { Test-Path -LiteralPath $_ -PathType Container }
+
+          function Get-DependentDllNames {
+            param([Parameter(Mandatory=$true)][string]$BinaryPath)
+            $output = & $dumpbin.FullName /DEPENDENTS $BinaryPath 2>&1
+            if ($LASTEXITCODE -ne 0) {
+              throw "dumpbin /DEPENDENTS failed for ${BinaryPath}: exit code $LASTEXITCODE`n$($output -join [Environment]::NewLine)"
+            }
+            @($output | ForEach-Object {
+              if ($_ -match '^\s+([A-Za-z0-9_.+\-]+\.dll)\s*$') { $matches[1] }
+            } | Sort-Object -Unique)
+          }
+
+          function Resolve-DependencyPath {
+            param(
+              [Parameter(Mandatory=$true)][string]$DllName,
+              [Parameter(Mandatory=$true)][string[]]$SearchDirs
+            )
+            foreach ($dir in $SearchDirs) {
+              if (-not $dir) { continue }
+              $candidate = Join-Path $dir $DllName
+              if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+            }
+            return $null
+          }
+
+          function Add-RuntimeDependencyClosure {
+            param(
+              [Parameter(Mandatory=$true)][string]$Destination,
+              [Parameter(Mandatory=$true)][string[]]$BuildDirs
+            )
+            $destPath = (Resolve-Path $Destination).Path
+            $searchDirs = @($destPath) + @($BuildDirs) + @($cudaRuntimeDirs) + @($vcRuntimeDirs)
+            $queue = [System.Collections.Generic.Queue[string]]::new()
+            Get-ChildItem $destPath -File | Where-Object { $_.Extension -in '.exe','.dll' } | ForEach-Object { $queue.Enqueue($_.FullName) }
+            $visited = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            $unresolved = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            $copied = [System.Collections.Generic.List[string]]::new()
+
+            while ($queue.Count -gt 0) {
+              $binary = $queue.Dequeue()
+              if (-not $visited.Add($binary)) { continue }
+              foreach ($dep in (Get-DependentDllNames -BinaryPath $binary)) {
+                $local = Join-Path $destPath $dep
+                if (Test-Path -LiteralPath $local -PathType Leaf) {
+                  if ($visited.Add($local)) {
+                    $visited.Remove($local) | Out-Null
+                    $queue.Enqueue($local)
+                  }
+                  continue
+                }
+
+                $resolved = Resolve-DependencyPath -DllName $dep -SearchDirs $searchDirs
+                if ($resolved) {
+                  Copy-Item -LiteralPath $resolved -Destination $local -Force
+                  $copied.Add("$dep <= $resolved") | Out-Null
+                  $queue.Enqueue($local)
+                  continue
+                }
+
+                # Windows system DLLs are intentionally not copied app-local.
+                $systemDll = Join-Path $env:SystemRoot "System32\$dep"
+                if (Test-Path -LiteralPath $systemDll -PathType Leaf) { continue }
+                $unresolved.Add($dep) | Out-Null
+              }
+            }
+
+            $report = @(
+              "Runtime directory: $destPath",
+              "dumpbin: $($dumpbin.FullName)",
+              '',
+              'App-local files:'
+            ) + @(Get-ChildItem $destPath -File | Sort-Object Name | ForEach-Object { "  $($_.Name)" }) + @(
+              '',
+              'Dependencies copied by closure:'
+            ) + @($copied | Sort-Object | ForEach-Object { "  $_" }) + @(
+              '',
+              'Unresolved non-system dependencies:'
+            ) + @($unresolved | Sort-Object | ForEach-Object { "  $_" })
+            $report | Set-Content -Encoding UTF8 (Join-Path $destPath 'DEPENDENCIES.txt')
+
+            if ($unresolved.Count -gt 0) {
+              throw "Unresolved non-system DLL dependencies in ${Destination}: $(@($unresolved) -join ', ')"
+            }
+          }
+
+          Add-RuntimeDependencyClosure -Destination 'dist\whispercpp' -BuildDirs @($wbin)
+          Add-RuntimeDependencyClosure -Destination 'dist\parakeetcpp' -BuildDirs @($pbin, $pkExe.DirectoryName)
+          Add-RuntimeDependencyClosure -Destination 'dist\llamacpp' -BuildDirs @($lbin)
+
           @"
           Windows CUDA 13.2 / sm_75 ASR runtimes
           ======================================
@@ -136,6 +252,7 @@ jobs:
           dist\whispercpp contains whisper-cli.exe and whisper.cpp parakeet-cli.exe (0.6B v3).
           dist\parakeetcpp contains parakeet11-cli.exe (parakeet.cpp, supports 1.1B families).
           dist\llamacpp contains llama-mtmd-cli.exe.
+          Each runtime directory contains DEPENDENCIES.txt with the dependency closure report.
           Keep each executable beside the DLLs from its own folder.
           "@ | Set-Content -Encoding UTF8 dist\BUILD_INFO.txt
 
@@ -145,7 +262,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $env:PATH = "$env:CUDA_PATH\bin;$env:PATH"
+          $env:PATH = "$env:CUDA_PATH\bin;$env:CUDA_PATH\bin\x64;$env:PATH"
 
           function Invoke-RuntimeHelpTest {
             param([Parameter(Mandatory=$true)][string]$ExePath)
@@ -156,7 +273,17 @@ jobs:
             & $ExePath --help
             $exitCode = $LASTEXITCODE
             if ($exitCode -ne 0) {
-              throw "Runtime help smoke test failed with exit code ${exitCode}: $ExePath"
+              $runtimeDir = Split-Path -Parent $ExePath
+              Write-Host "Runtime directory contents:" -ForegroundColor Yellow
+              Get-ChildItem $runtimeDir -File | Sort-Object Name | ForEach-Object { Write-Host "  $($_.Name)" }
+              $dependencyReport = Join-Path $runtimeDir 'DEPENDENCIES.txt'
+              if (Test-Path -LiteralPath $dependencyReport -PathType Leaf) {
+                Write-Host "Dependency report:" -ForegroundColor Yellow
+                Get-Content -LiteralPath $dependencyReport | ForEach-Object { Write-Host $_ }
+              }
+              $unsignedExit = [uint32]([int64]$exitCode -band 0xFFFFFFFFL)
+              $hexExit = ('0x{0:X8}' -f $unsignedExit)
+              throw "Runtime help smoke test failed with exit code ${exitCode} (${hexExit}): $ExePath"
             }
           }
 
