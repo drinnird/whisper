@@ -9,7 +9,7 @@ permissions:
 jobs:
   build:
     runs-on: windows-2022
-    timeout-minutes: 150
+    timeout-minutes: 120
 
     steps:
       - name: Install CUDA Toolkit 13.2
@@ -29,10 +29,8 @@ jobs:
         shell: pwsh
         run: |
           git clone --depth 1 https://github.com/ggml-org/whisper.cpp.git whisper.cpp
-          git clone --depth 1 https://github.com/ggml-org/llama.cpp.git llama.cpp
           git clone --depth 1 --recursive https://github.com/mudler/parakeet.cpp.git parakeet.cpp
           "WHISPER_COMMIT=$(git -C whisper.cpp rev-parse HEAD)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-          "LLAMA_COMMIT=$(git -C llama.cpp rev-parse HEAD)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           "PARAKEET_COMMIT=$(git -C parakeet.cpp rev-parse HEAD)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Verify CUDA
@@ -79,38 +77,18 @@ jobs:
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
           cmake --build build-parakeet --config Release --parallel %NUMBER_OF_PROCESSORS% --target parakeet-cli
 
-      - name: Configure llama.cpp
-        shell: cmd
-        run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-          cmake -S llama.cpp -B build-llama -G "Ninja Multi-Config" ^
-            -DGGML_CUDA=ON ^
-            -DGGML_CUDA_FORCE_MMQ=ON ^
-            -DGGML_NATIVE=OFF ^
-            -DCMAKE_CUDA_ARCHITECTURES=75 ^
-            -DCMAKE_CUDA_COMPILER="%CUDA_PATH%\bin\nvcc.exe"
-
-      - name: Build Qwen multimodal runtime
-        shell: cmd
-        run: |
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-          cmake --build build-llama --config Release --parallel %NUMBER_OF_PROCESSORS% --target llama-mtmd-cli
-
       - name: Package runtimes
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          New-Item -ItemType Directory -Force dist\whispercpp, dist\parakeetcpp, dist\llamacpp | Out-Null
+          New-Item -ItemType Directory -Force dist\whispercpp, dist\parakeetcpp | Out-Null
 
           $wbin = Join-Path $env:GITHUB_WORKSPACE 'build-whisper\bin\Release'
-          $lbin = Join-Path $env:GITHUB_WORKSPACE 'build-llama\bin\Release'
           $pbin = Join-Path $env:GITHUB_WORKSPACE 'build-parakeet\bin\Release'
           if (-not (Test-Path "$wbin\whisper-cli.exe")) { throw 'whisper-cli.exe missing' }
           if (-not (Test-Path "$wbin\parakeet-cli.exe")) { throw 'whisper.cpp parakeet-cli.exe missing' }
-          if (-not (Test-Path "$lbin\llama-mtmd-cli.exe")) { throw 'llama-mtmd-cli.exe missing' }
 
           Get-ChildItem $wbin -File | Where-Object { $_.Extension -in '.exe','.dll' } | Copy-Item -Destination dist\whispercpp
-          Get-ChildItem $lbin -File | Where-Object { $_.Extension -in '.exe','.dll' } | Copy-Item -Destination dist\llamacpp
 
           $pkCandidates = @(Get-ChildItem "$env:GITHUB_WORKSPACE\build-parakeet" -Filter parakeet-cli.exe -File -Recurse |
             Where-Object { $_.FullName -match '\\Release\\|examples\\cli' })
@@ -125,9 +103,8 @@ jobs:
             Where-Object { $_.FullName -match '\\Release\\|bin' } |
             ForEach-Object { Copy-Item $_.FullName -Destination 'dist\parakeetcpp' -Force }
 
-          # Build an app-local dependency closure for each runtime. This catches DLLs that
-          # CMake emits outside the immediate executable directory and CUDA/MSVC runtime
-          # dependencies that otherwise cause STATUS_DLL_NOT_FOUND (0xC0000135) at startup.
+          # Build an app-local dependency closure for the runtimes compiled in this workflow.
+          # Qwen/llama.cpp is intentionally external and is not built or packaged here.
           $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
           if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) { throw "vswhere.exe not found: $vswhere" }
           $vsInstall = (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1)
@@ -178,8 +155,6 @@ jobs:
 
           function Test-WindowsApiSetName {
             param([Parameter(Mandatory=$true)][string]$DllName)
-            # API-set contract DLL names are resolved by the Windows loader and are not
-            # app-local files. They may not exist as literal files in System32.
             return ($DllName -match '^(api|ext)-ms-win-.*\.dll$')
           }
 
@@ -217,12 +192,7 @@ jobs:
                   continue
                 }
 
-                # Windows API-set contracts are loader-provided virtual/system contracts.
-                # They often do not exist as literal files in System32, so classify them
-                # before the physical System32 file check.
                 if (Test-WindowsApiSetName -DllName $dep) { continue }
-
-                # Windows system DLLs are intentionally not copied app-local.
                 $systemDll = Join-Path $env:SystemRoot "System32\$dep"
                 if (Test-Path -LiteralPath $systemDll -PathType Leaf) { continue }
                 $unresolved.Add($dep) | Out-Null
@@ -250,22 +220,20 @@ jobs:
 
           Add-RuntimeDependencyClosure -Destination 'dist\whispercpp' -BuildDirs @($wbin)
           Add-RuntimeDependencyClosure -Destination 'dist\parakeetcpp' -BuildDirs @($pbin, $pkExe.DirectoryName)
-          Add-RuntimeDependencyClosure -Destination 'dist\llamacpp' -BuildDirs @($lbin)
 
           @"
           Windows CUDA 13.2 / sm_75 ASR runtimes
           ======================================
           whisper.cpp commit:  $env:WHISPER_COMMIT
           parakeet.cpp commit: $env:PARAKEET_COMMIT
-          llama.cpp commit:    $env:LLAMA_COMMIT
           CUDA architecture:   75 (GTX 1650 / Turing)
           GGML_CUDA_FORCE_MMQ:  ON
 
           dist\whispercpp contains whisper-cli.exe and whisper.cpp parakeet-cli.exe (0.6B v3).
           dist\parakeetcpp contains parakeet11-cli.exe (parakeet.cpp, supports 1.1B families).
-          dist\llamacpp contains llama-mtmd-cli.exe.
-          Each runtime directory contains DEPENDENCIES.txt with the dependency closure report.
-          Keep each executable beside the DLLs from its own folder.
+          Qwen3-ASR is intentionally not built here. Install a complete official llama.cpp Windows release under package\bin\llamacpp\.
+          Each built runtime directory contains DEPENDENCIES.txt with the dependency closure report.
+          Keep each executable beside the DLLs from its own runtime distribution.
           "@ | Set-Content -Encoding UTF8 dist\BUILD_INFO.txt
 
           Compress-Archive -Path dist\* -DestinationPath ASR-CUDA132-sm75-runtimes.zip -Force
@@ -302,7 +270,6 @@ jobs:
           Invoke-RuntimeHelpTest '.\dist\whispercpp\whisper-cli.exe'
           Invoke-RuntimeHelpTest '.\dist\whispercpp\parakeet-cli.exe'
           Invoke-RuntimeHelpTest '.\dist\parakeetcpp\parakeet11-cli.exe'
-          Invoke-RuntimeHelpTest '.\dist\llamacpp\llama-mtmd-cli.exe'
 
       - name: Upload runtimes
         uses: actions/upload-artifact@v4
