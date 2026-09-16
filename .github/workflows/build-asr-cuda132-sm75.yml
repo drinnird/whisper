@@ -245,14 +245,24 @@ jobs:
           $env:PATH = "$env:CUDA_PATH\bin;$env:CUDA_PATH\bin\x64;$env:PATH"
 
           function Invoke-RuntimeHelpTest {
-            param([Parameter(Mandatory=$true)][string]$ExePath)
+            param(
+              [Parameter(Mandatory=$true)][string]$ExePath,
+              [int[]]$AllowedExitCodes = @(0),
+              [string]$RequiredOutputPattern = ''
+            )
             if (-not (Test-Path -LiteralPath $ExePath -PathType Leaf)) {
               throw "Runtime executable is missing: $ExePath"
             }
+
             Write-Host "Smoke testing $ExePath --help"
-            & $ExePath --help
+            $helpOutput = @(& $ExePath --help 2>&1)
             $exitCode = $LASTEXITCODE
-            if ($exitCode -ne 0) {
+            $helpOutput | ForEach-Object { Write-Host $_ }
+            $helpText = ($helpOutput | Out-String)
+
+            $exitCodeAccepted = $AllowedExitCodes -contains $exitCode
+            $outputAccepted = [string]::IsNullOrWhiteSpace($RequiredOutputPattern) -or ($helpText -match $RequiredOutputPattern)
+            if (-not $exitCodeAccepted -or -not $outputAccepted) {
               $runtimeDir = Split-Path -Parent $ExePath
               Write-Host "Runtime directory contents:" -ForegroundColor Yellow
               Get-ChildItem $runtimeDir -File | Sort-Object Name | ForEach-Object { Write-Host "  $($_.Name)" }
@@ -261,15 +271,20 @@ jobs:
                 Write-Host "Dependency report:" -ForegroundColor Yellow
                 Get-Content -LiteralPath $dependencyReport | ForEach-Object { Write-Host $_ }
               }
+              if (-not $outputAccepted) {
+                Write-Host "Expected help output pattern was not found: $RequiredOutputPattern" -ForegroundColor Yellow
+              }
               $unsignedExit = [uint32]([int64]$exitCode -band 0xFFFFFFFFL)
               $hexExit = ('0x{0:X8}' -f $unsignedExit)
-              throw "Runtime help smoke test failed with exit code ${exitCode} (${hexExit}): $ExePath"
+              $allowedText = ($AllowedExitCodes -join ', ')
+              throw "Runtime help smoke test failed with exit code ${exitCode} (${hexExit}); allowed exit codes: ${allowedText}: $ExePath"
             }
           }
 
           Invoke-RuntimeHelpTest '.\dist\whispercpp\whisper-cli.exe'
           Invoke-RuntimeHelpTest '.\dist\whispercpp\parakeet-cli.exe'
-          Invoke-RuntimeHelpTest '.\dist\parakeetcpp\parakeet11-cli.exe'
+          Invoke-RuntimeHelpTest '.\dist\parakeetcpp\parakeet11-cli.exe' -AllowedExitCodes @(0, 2) -RequiredOutputPattern '(?is)usage:.*parakeet-cli\s+transcribe'
+
 
       - name: Upload runtimes
         uses: actions/upload-artifact@v4
