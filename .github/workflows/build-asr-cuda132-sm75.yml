@@ -248,20 +248,57 @@ jobs:
             param(
               [Parameter(Mandatory=$true)][string]$ExePath,
               [int[]]$AllowedExitCodes = @(0),
-              [string]$RequiredOutputPattern = ''
+              [string]$RequiredOutputPattern = '',
+              [switch]$AcceptCliUsageExitCode
             )
             if (-not (Test-Path -LiteralPath $ExePath -PathType Leaf)) {
               throw "Runtime executable is missing: $ExePath"
             }
 
             Write-Host "Smoke testing $ExePath --help"
-            $helpOutput = @(& $ExePath --help 2>&1)
-            $exitCode = $LASTEXITCODE
-            $helpOutput | ForEach-Object { Write-Host $_ }
-            $helpText = ($helpOutput | Out-String)
 
-            $exitCodeAccepted = $AllowedExitCodes -contains $exitCode
+            # Use ProcessStartInfo rather than PowerShell's native-command pipeline so a
+            # legitimate nonzero CLI usage exit cannot be promoted to a terminating error
+            # by $ErrorActionPreference / $PSNativeCommandUseErrorActionPreference.
+            $resolvedExe = (Resolve-Path -LiteralPath $ExePath).Path
+            $psi = [System.Diagnostics.ProcessStartInfo]::new()
+            $psi.FileName = $resolvedExe
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            [void]$psi.ArgumentList.Add('--help')
+
+            $process = [System.Diagnostics.Process]::new()
+            $process.StartInfo = $psi
+            try {
+              if (-not $process.Start()) { throw "Runtime process could not be started: $ExePath" }
+              $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+              $stderrTask = $process.StandardError.ReadToEndAsync()
+              $process.WaitForExit()
+              $stdout = $stdoutTask.GetAwaiter().GetResult()
+              $stderr = $stderrTask.GetAwaiter().GetResult()
+              $exitCode = $process.ExitCode
+            }
+            finally {
+              $process.Dispose()
+            }
+
+            if (-not [string]::IsNullOrEmpty($stdout)) { Write-Host $stdout.TrimEnd() }
+            if (-not [string]::IsNullOrEmpty($stderr)) { Write-Host $stderr.TrimEnd() }
+            $helpText = "$stdout`n$stderr"
+
             $outputAccepted = [string]::IsNullOrWhiteSpace($RequiredOutputPattern) -or ($helpText -match $RequiredOutputPattern)
+            if ($AcceptCliUsageExitCode) {
+              # parakeet.cpp has returned different ordinary CLI usage codes across upstream
+              # revisions. A normal 0..255 code is acceptable only when the expected usage
+              # signature is present. Signed-negative NTSTATUS loader/crash codes still fail.
+              $exitCodeAccepted = ($exitCode -ge 0 -and $exitCode -le 255 -and $outputAccepted)
+            }
+            else {
+              $exitCodeAccepted = $AllowedExitCodes -contains $exitCode
+            }
+
             if (-not $exitCodeAccepted -or -not $outputAccepted) {
               $runtimeDir = Split-Path -Parent $ExePath
               Write-Host "Runtime directory contents:" -ForegroundColor Yellow
@@ -276,14 +313,19 @@ jobs:
               }
               $unsignedExit = [uint32]([int64]$exitCode -band 0xFFFFFFFFL)
               $hexExit = ('0x{0:X8}' -f $unsignedExit)
-              $allowedText = ($AllowedExitCodes -join ', ')
-              throw "Runtime help smoke test failed with exit code ${exitCode} (${hexExit}); allowed exit codes: ${allowedText}: $ExePath"
+              if ($AcceptCliUsageExitCode) {
+                $exitExpectation = 'ordinary CLI exit 0..255 plus required usage signature'
+              }
+              else {
+                $exitExpectation = 'allowed exit codes: ' + ($AllowedExitCodes -join ', ')
+              }
+              throw "Runtime help smoke test failed with exit code ${exitCode} (${hexExit}); ${exitExpectation}: $ExePath"
             }
           }
 
           Invoke-RuntimeHelpTest '.\dist\whispercpp\whisper-cli.exe'
           Invoke-RuntimeHelpTest '.\dist\whispercpp\parakeet-cli.exe'
-          Invoke-RuntimeHelpTest '.\dist\parakeetcpp\parakeet11-cli.exe' -AllowedExitCodes @(0, 2) -RequiredOutputPattern '(?is)usage:.*parakeet-cli\s+transcribe'
+          Invoke-RuntimeHelpTest '.\dist\parakeetcpp\parakeet11-cli.exe' -RequiredOutputPattern '(?is)usage:.*parakeet-cli\s+transcribe' -AcceptCliUsageExitCode
 
 
       - name: Upload runtimes
